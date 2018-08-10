@@ -1,0 +1,9 @@
+* lsm 代码结构
+** lsm_entry
+   内核模块入口
+
+** lsm_hooks
+   security_operations hooks
+
+** lsm_nlmsg
+   内核空间和用户空间通信，使用 netlink 技术通信。
