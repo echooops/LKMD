@@ -9,19 +9,59 @@
 #include <linux/skbuff.h>
 #include <linux/delay.h>
 #include <linux/kthread.h>
+
 #include "vlsm_nlmsg.h"
 #include "vlsm_utils.h"
-
+#include "vlsm_deals.h"
 /* sock */
 static struct sock *nlfd = NULL;
 
 /* 读写锁 */
-struct {
+static struct {
     __u32 pid;
     rwlock_t lock;
 } user_proc;
 
-/* 对外接口 */
+
+/* 为了不滥用kmalloc针对之前的接口而改造的sender --- 完全为了兼容之前而写的接口*/
+int vlsm_nlmsg_sender(void *h, int hs, void *d, int ds)
+{
+    struct sk_buff *nl_skb = NULL;
+    struct nlmsghdr *nlh = NULL;
+    int ret = 0, len = 0;
+
+    len = hs + ds;
+    /* 创建skb */
+    nl_skb = nlmsg_new(len, GFP_ATOMIC);
+    if(!nl_skb) {
+        log_error("netlink_alloc_skb error");
+        return -1;
+    }
+    /* 看了下内核的代码，下面的函数不是直观上的put到什么列表里，而是针对nlh的做些初始化工作 */
+    nlh = nlmsg_put(nl_skb, 0, 0, 0, len, 0);
+    if(!nlh) {
+        log_error("nlmsg_put error\n");
+        nlmsg_free(nl_skb);
+        return -1;
+    }
+    /* 拷贝头 */
+    memcpy(nlmsg_data(nlh), h, hs);
+    /* 拷贝数据 */
+    memcpy(nlmsg_data(nlh) + hs, d, ds);
+
+    /* 发送数据 */
+    read_lock_bh(&user_proc.lock);
+    if (user_proc.pid != 0) {   /* pid = 0 是发给自己 */
+        ret = netlink_unicast(nlfd, nl_skb, user_proc.pid, MSG_DONTWAIT);
+    }
+    read_unlock_bh(&user_proc.lock);
+
+    ret < 0 ? log_error("netlink_unicast, return: %d.", ret) : \
+        log_debug("netlink_unicast, return: %d.", ret);
+    return ret;
+}
+
+/* 对外普适单播发送数据接口 */
 int send_to_user(char *pbuf, uint16_t len)
 {
     struct sk_buff *nl_skb = NULL;
@@ -43,13 +83,18 @@ int send_to_user(char *pbuf, uint16_t len)
         return -1;
     }
     memcpy(nlmsg_data(nlh), pbuf, len);
+
     /* 发送数据 */
-    ret = netlink_unicast(nlfd, nl_skb, 50, MSG_DONTWAIT);
-    /* if (ret < 0) { */
-    /*     log_error("netlink_unicast, return: %d.", ret); */
-    /*     nlmsg_free(nl_skb); */
-    /* } */
-    log_debug("netlink_unicast, return: %d.", ret);
+    read_lock_bh(&user_proc.lock);
+    if (user_proc.pid != 0) {   /* pid = 0 是发给自己 */
+        ret = netlink_unicast(nlfd, nl_skb, user_proc.pid, MSG_DONTWAIT);
+    }
+    read_unlock_bh(&user_proc.lock);
+    //else read_unlock_bh(&user_proc.lock);
+
+    ret < 0 ? log_error("netlink_unicast, return: %d.", ret) :  \
+        log_debug("netlink_unicast, return: %d.", ret);
+
     return ret;
 }
 
@@ -58,46 +103,43 @@ static void recv_callback(struct sk_buff *skb)
 {
     struct nlmsghdr *nlh = NULL;
     void *data = NULL;
-    int i = 100;
-    int ret = 0;
     log_debug("skb->len:%u\n", skb->len);
     if(skb->len >= nlmsg_total_size(0)) {
         /* 取包头 */
         nlh = nlmsg_hdr(skb);
+        /* 设置接收用户pid */
+        write_lock_bh(&user_proc.lock);
+        user_proc.pid = nlh->nlmsg_pid;
+        write_unlock_bh(&user_proc.lock);
         /* 取数据 */
         data = nlmsg_data(nlh);
-        /* 刷配置 */
         if(data) {
-            log_debug("kernel receive data: %s\n", (int8_t *)data);
-            while(i--) {
-                snprintf(data, nlmsg_len(nlh),"hello %d", i);
-                ret = send_to_user(data, nlmsg_len(nlh));
-                while (ret == -EAGAIN) {
-                    set_current_state(TASK_UNINTERRUPTIBLE);
-                    ret = send_to_user(data, nlmsg_len(nlh));
-                    schedule_timeout(HZ);
-                }
-            }
+            /* 刷配置 */
+            //vlsm_update_config(data);
+            /* 回消息 */
+            send_to_user(VLSM_CFG_ECHO_FIX_MSG, strlen(VLSM_CFG_ECHO_FIX_MSG));
         }
-        /* 回消息 */
     }
 }
 
 /* 构造nlmsg模块 */
 __init int vlsm_nlmsg_init(void)
 {
-    /* rwlock_init(&user_porc.lock); */
     struct netlink_kernel_cfg cfg = {
         .input = recv_callback,
     };
+
+    rwlock_init(&user_proc.lock);
+
     nlfd = netlink_kernel_create(&init_net, NETLINK_VLSM, &cfg);
     if(!nlfd) {
         log_error("can not create a netlink socket!\n");
         return -1;
     }
-    log_debug("constructor!\n");
+    log_debug("nlmsg constructor!");
     return 0;
 }
+
 /* 析构nlmsg模块 */
 __exit void vlsm_nlmsg_exit(void)
 {
@@ -105,7 +147,7 @@ __exit void vlsm_nlmsg_exit(void)
         netlink_kernel_release(nlfd);
         nlfd = NULL;
     }
-    log_debug("destructor\n");
+    log_debug("nlmsg destructor");
 }
 
 /*
